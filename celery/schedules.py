@@ -20,7 +20,7 @@ from .utils.time import (
 )
 
 __all__ = [
-    'ParseException', 'schedule', 'crontab', 'crontab_parser',
+    'ParseException', 'schedule', 'crontab', 'crontabext', 'crontab_parser',
     'maybe_schedule', 'solar',
 ]
 
@@ -39,6 +39,12 @@ int, str, or an iterable type. {type!r} was given.\
 CRON_REPR = """\
 <crontab: {0._orig_minute} {0._orig_hour} {0._orig_day_of_week} \
 {0._orig_day_of_month} {0._orig_month_of_year} (m/h/d/dM/MY)>\
+"""
+
+CRON_EXT_REPR = """\
+<crontabext: {0._orig_second} {0._orig_minute} {0._orig_hour} \
+{0._orig_day_of_week} {0._orig_day_of_month} {0._orig_month_of_year} \
+(s/m/h/d/dM/MY)>
 """
 
 SOLAR_INVALID_LATITUDE = """\
@@ -637,6 +643,236 @@ class crontab(BaseSchedule):
                 other.hour == self.hour and
                 other.minute == self.minute and
                 super(crontab, self).__eq__(other)
+            )
+        return NotImplemented
+
+    def __ne__(self, other):
+        res = self.__eq__(other)
+        if res is NotImplemented:
+            return True
+        return not res
+
+
+@python_2_unicode_compatible
+class crontabext(BaseSchedule):
+
+    def __init__(self, second="*", minute='*', hour='*', day_of_week='*',
+                 day_of_month='*', month_of_year='*', **kwargs):
+        self._orig_second = cronfield(second)
+        self._orig_minute = cronfield(minute)
+        self._orig_hour = cronfield(hour)
+        self._orig_day_of_week = cronfield(day_of_week)
+        self._orig_day_of_month = cronfield(day_of_month)
+        self._orig_month_of_year = cronfield(month_of_year)
+        self._orig_kwargs = kwargs
+        self.hour = self._expand_cronspec(hour, 24)
+        self.minute = self._expand_cronspec(minute, 60)
+        self.second = self._expand_cronspec(second, 60)
+        self.day_of_week = self._expand_cronspec(day_of_week, 7)
+        self.day_of_month = self._expand_cronspec(day_of_month, 31, 1)
+        self.month_of_year = self._expand_cronspec(month_of_year, 12, 1)
+        super(crontabext, self).__init__(**kwargs)
+
+    @staticmethod
+    def _expand_cronspec(cronspec, max_, min_=0):
+        if isinstance(cronspec, numbers.Integral):
+            result = {cronspec}
+        elif isinstance(cronspec, string_t):
+            result = crontab_parser(max_, min_).parse(cronspec)
+        elif isinstance(cronspec, set):
+            result = cronspec
+        elif isinstance(cronspec, Iterable):
+            result = set(cronspec)
+        else:
+            raise TypeError(CRON_INVALID_TYPE.format(type=type(cronspec)))
+
+        # assure the result does not preceed the min or exceed the max
+        for number in result:
+            if number >= max_ + min_ or number < min_:
+                raise ValueError(CRON_PATTERN_INVALID.format(
+                    min=min_, max=max_ - 1 + min_, value=number))
+        return result
+
+    def _delta_to_next(self, last_run_at, next_hour, next_minute, next_second):
+        datedata = AttributeDict(year=last_run_at.year)
+        days_of_month = sorted(self.day_of_month)
+        months_of_year = sorted(self.month_of_year)
+
+        def day_out_of_range(year, month, day):
+            try:
+                datetime(year=year, month=month, day=day)
+            except ValueError:
+                return True
+            return False
+
+        def roll_over():
+            for _ in range(2000):
+                flag = (datedata.dom == len(days_of_month) or
+                        day_out_of_range(datedata.year,
+                                         months_of_year[datedata.moy],
+                                         days_of_month[datedata.dom]) or
+                        (self.maybe_make_aware(datetime(datedata.year,
+                                                        months_of_year[datedata.moy],
+                                                        days_of_month[datedata.dom])) < last_run_at))
+
+                if flag:
+                    datedata.dom = 0
+                    datedata.moy += 1
+                    if datedata.moy == len(months_of_year):
+                        datedata.moy = 0
+                        datedata.year += 1
+                else:
+                    break
+            else:
+                # Tried 2000 times, we're most likely in an infinite loop
+                raise RuntimeError('unable to rollover, '
+                                   'time specification is probably invalid')
+
+        if last_run_at.month in self.month_of_year:
+            datedata.dom = bisect(days_of_month, last_run_at.day)
+            datedata.moy = bisect_left(months_of_year, last_run_at.month)
+        else:
+            datedata.dom = 0
+            datedata.moy = bisect(months_of_year, last_run_at.month)
+            if datedata.moy == len(months_of_year):
+                datedata.moy = 0
+        roll_over()
+
+        while 1:
+            th = datetime(year=datedata.year,
+                          month=months_of_year[datedata.moy],
+                          day=days_of_month[datedata.dom])
+            if th.isoweekday() % 7 in self.day_of_week:
+                break
+            datedata.dom += 1
+            roll_over()
+
+        return ffwd(year=datedata.year,
+                    month=months_of_year[datedata.moy],
+                    day=days_of_month[datedata.dom],
+                    hour=next_hour,
+                    minute=next_minute,
+                    second=next_second,
+                    microsecond=0)
+
+    def __repr__(self):
+        return CRON_EXT_REPR.format(self)
+
+    def __reduce__(self):
+        return (self.__class__, (self._orig_second,
+                                 self._orig_minute,
+                                 self._orig_hour,
+                                 self._orig_day_of_week,
+                                 self._orig_day_of_month,
+                                 self._orig_month_of_year), self._orig_kwargs)
+
+    def __setstate__(self, state):
+        # Calling super's init because the kwargs aren't necessarily passed in
+        # the same form as they are stored by the superclass
+        super(crontabext, self).__init__(**state)
+
+    def remaining_delta(self, last_run_at, tz=None, ffwd=ffwd):
+        # pylint: disable=redefined-outer-name
+        # caching global ffwd
+        tz = tz or self.tz
+        last_run_at = self.maybe_make_aware(last_run_at)
+        now = self.maybe_make_aware(self.now())
+        dow_num = last_run_at.isoweekday() % 7  # Sunday is day 0, not day 7
+
+        execute_this_date = (
+            last_run_at.month in self.month_of_year and
+            last_run_at.day in self.day_of_month and
+            dow_num in self.day_of_week
+        )
+
+        execute_this_hour = (
+            execute_this_date and
+            last_run_at.day == now.day and
+            last_run_at.month == now.month and
+            last_run_at.year == now.year and
+            last_run_at.hour in self.hour and
+            last_run_at.minute < max(self.minute)
+        )
+
+        execute_this_minute = (
+            execute_this_date and
+            last_run_at.day == now.day and
+            last_run_at.month == now.month and
+            last_run_at.year == now.year and
+            last_run_at.hour in self.hour and
+            last_run_at.minute in self.minute and
+            last_run_at.second < max(self.second)
+        )
+
+        if execute_this_minute:
+            next_minute = now.minute
+            next_second = min(second for second in self.second if
+                              second > last_run_at.second)
+            delta = ffwd(minute=next_minute, second=next_second, microsecond=0)
+        else:
+            if execute_this_hour:
+                next_minute = min([minute for minute in self.minute
+                                  if minute > last_run_at.minute])
+                next_second = min(self.second)
+                delta = ffwd(minute=next_minute, second=next_second, microsecond=0)
+            else:
+                next_minute = min(self.minute)
+                next_second = min(self.second)
+
+                execute_today = (execute_this_date and
+                                 last_run_at.hour < max(self.hour))
+
+                if execute_today:
+                    next_hour = min(hour for hour in self.hour
+                                    if hour > last_run_at.hour)
+                    delta = ffwd(hour=next_hour, minute=next_minute,
+                                 second=next_second, microsecond=0)
+                else:
+                    next_hour = min(self.hour)
+                    all_dom_moy = (self._orig_day_of_month == '*' and
+                                   self._orig_month_of_year == '*')
+                    if all_dom_moy:
+                        next_day = min([day for day in self.day_of_week
+                                        if day > dow_num] or self.day_of_week)
+                        add_week = next_day == dow_num
+
+                        delta = ffwd(
+                            weeks=add_week and 1 or 0,
+                            weekday=(next_day - 1) % 7,
+                            hour=next_hour,
+                            minute=next_minute,
+                            second=next_second,
+                            microsecond=0,
+                        )
+                    else:
+                        delta = self._delta_to_next(last_run_at,
+                                                    next_hour, next_minute, next_second)
+        return self.to_local(last_run_at), delta, self.to_local(now)
+
+    def remaining_estimate(self, last_run_at, ffwd=ffwd):
+        # pylint: disable=redefined-outer-name
+        # caching global ffwd
+        return remaining(*self.remaining_delta(last_run_at, ffwd=ffwd))
+
+    def is_due(self, last_run_at):
+        rem_delta = self.remaining_estimate(last_run_at)
+        rem = max(rem_delta.total_seconds(), 0)
+        due = rem == 0
+        if due:
+            rem_delta = self.remaining_estimate(self.now())
+            rem = max(rem_delta.total_seconds(), 0)
+        return schedstate(due, rem)
+
+    def __eq__(self, other):
+        if isinstance(other, crontabext):
+            return (
+                other.month_of_year == self.month_of_year and
+                other.day_of_month == self.day_of_month and
+                other.day_of_week == self.day_of_week and
+                other.hour == self.hour and
+                other.minute == self.minute and
+                other.second == self.second and
+                super(crontabext, self).__eq__(other)
             )
         return NotImplemented
 
